@@ -7,9 +7,18 @@ let buildReleaseId = null;
 let pollTimer = null;
 let buildStartTime = 0;
 let consecutiveErrors = 0;
+
 const MAX_CONSECUTIVE_ERRORS = 5;
 
+// =============================================================
+// GitHub OAuth Configuration
+// =============================================================
+
+const OAUTH_WORKER_URL =
+  'https://quiet-wildflower-c912.ramzy-fenhas.workers.dev/oauth/callback';
+
 // ---- Auth helpers ----
+
 function getToken() {
   return sessionStorage.getItem('gh_token');
 }
@@ -18,116 +27,191 @@ function isLoggedIn() {
   return !!getToken();
 }
 
-async function connectWithToken() {
+function toggleTokenVisibility() {
+  const inp = document.getElementById('token-input');
+
+  if (!inp) return;
+
+  inp.type = inp.type === 'password' ? 'text' : 'password';
+}
+
+// =============================================================
+// GitHub OAuth Login
+// =============================================================
+
+function connectWithToken() {
   const statusEl = document.getElementById('auth-status');
   const btn = document.getElementById('btn-connect');
 
-  btn.disabled = true;
-  btn.textContent = 'Connecting...';
-  statusEl.innerHTML = '<span>Opening GitHub authorization...</span>';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Opening GitHub...';
+  }
+
+  if (statusEl) {
+    statusEl.innerHTML =
+      '<span>Opening GitHub authorization...</span>';
+  }
+
+  const authorizeUrl =
+    'https://github.com/login/oauth/authorize' +
+    '?client_id=' +
+    encodeURIComponent(CONFIG.GITHUB_CLIENT_ID) +
+    '&redirect_uri=' +
+    encodeURIComponent(OAUTH_WORKER_URL) +
+    '&scope=' +
+    encodeURIComponent('repo');
+
+  window.location.href = authorizeUrl;
+}
+
+// =============================================================
+// Handle OAuth callback
+// =============================================================
+
+async function handleOAuthCallback() {
+  const hash = window.location.hash;
+
+  if (!hash || hash.indexOf('github_token=') === -1) {
+    return false;
+  }
+
+  const params = new URLSearchParams(hash.substring(1));
+  const token = params.get('github_token');
+
+  if (!token) {
+    return false;
+  }
+
+  // Remove token from browser URL immediately
+  history.replaceState(
+    null,
+    document.title,
+    window.location.pathname + window.location.search
+  );
+
+  const statusEl = document.getElementById('auth-status');
+  const btn = document.getElementById('btn-connect');
+
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Verifying...';
+  }
+
+  if (statusEl) {
+    statusEl.innerHTML =
+      '<span>Verifying GitHub authorization...</span>';
+  }
 
   try {
-    // Start GitHub Device Flow
-    const response = await fetch('https://github.com/login/device/code', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Accept': 'application/json'
-      },
-      body:
-        'client_id=' + encodeURIComponent(CONFIG.GITHUB_CLIENT_ID) +
-        '&scope=' + encodeURIComponent('repo')
-    });
+    // ---------------------------------------------------------
+    // Verify GitHub user
+    // ---------------------------------------------------------
 
-    const data = await response.json();
-
-    if (!response.ok || !data.device_code) {
-      throw new Error(
-        data.error_description || 'Could not start GitHub authorization.'
-      );
-    }
-
-    const verificationUri = data.verification_uri;
-    const userCode = data.user_code;
-
-    statusEl.innerHTML =
-      '<span class="status-ok">' +
-      '1) Open GitHub: <a href="' + escAttr(verificationUri) +
-      '" target="_blank" rel="noopener">' + escHtml(verificationUri) + '</a><br>' +
-      '2) Enter this code: <strong>' + escHtml(userCode) + '</strong><br>' +
-      'Waiting for approval...' +
-      '</span>';
-
-    let interval = Math.max(data.interval || 5, 5) * 1000;
-    const deadline = Date.now() + (data.expires_in * 1000);
-
-    while (Date.now() < deadline) {
-      await sleep(interval);
-
-      const tokenResponse = await fetch(
-        'https://github.com/login/oauth/access_token',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Accept': 'application/json'
-          },
-          body:
-            'client_id=' + encodeURIComponent(CONFIG.GITHUB_CLIENT_ID) +
-            '&device_code=' + encodeURIComponent(data.device_code) +
-            '&grant_type=' +
-            encodeURIComponent(
-              'urn:ietf:params:oauth:grant-type:device_code'
-            )
+    const userResponse = await fetch(
+      'https://api.github.com/user',
+      {
+        headers: {
+          'Authorization': 'Bearer ' + token,
+          'Accept': 'application/vnd.github+json'
         }
-      );
-
-      const tokenData = await tokenResponse.json();
-
-      if (tokenData.access_token) {
-        sessionStorage.setItem('gh_token', tokenData.access_token);
-
-        statusEl.innerHTML =
-          '<span class="status-ok">Connected to GitHub successfully.</span>';
-
-        btn.textContent = 'Connected';
-
-        setTimeout(function() {
-          showBuildUI();
-        }, 400);
-
-        return;
       }
-
-      if (tokenData.error === 'authorization_pending') {
-        continue;
-      }
-
-      if (tokenData.error === 'slow_down') {
-        interval += 5000;
-        continue;
-      }
-
-      throw new Error(
-        tokenData.error_description ||
-        'GitHub authorization failed.'
-      );
-    }
-
-    throw new Error(
-      'GitHub authorization expired. Please try again.'
     );
 
-  } catch (err) {
-    statusEl.innerHTML =
-      '<span class="status-error">' +
-      escHtml(err.message) +
-      '</span>';
+    if (!userResponse.ok) {
+      throw new Error(
+        'GitHub authorization could not be verified.'
+      );
+    }
 
-    btn.disabled = false;
-    btn.textContent = 'Connect GitHub';
+    const user = await userResponse.json();
+
+    // ---------------------------------------------------------
+    // Verify repository access
+    // ---------------------------------------------------------
+
+    const repoResponse = await fetch(
+      'https://api.github.com/repos/' +
+        CONFIG.GITHUB_OWNER +
+        '/' +
+        CONFIG.GITHUB_REPO,
+      {
+        headers: {
+          'Authorization': 'Bearer ' + token,
+          'Accept': 'application/vnd.github+json'
+        }
+      }
+    );
+
+    if (!repoResponse.ok) {
+      if (repoResponse.status === 404) {
+        throw new Error(
+          'Repository ' +
+            CONFIG.GITHUB_OWNER +
+            '/' +
+            CONFIG.GITHUB_REPO +
+            ' was not found or GitHub access was not granted.'
+        );
+      }
+
+      if (repoResponse.status === 403) {
+        throw new Error(
+          'GitHub authorization does not have enough permission to access the repository.'
+        );
+      }
+
+      throw new Error(
+        'Could not access the GitHub repository (HTTP ' +
+          repoResponse.status +
+          ').'
+      );
+    }
+
+    // ---------------------------------------------------------
+    // Save token
+    // ---------------------------------------------------------
+
+    sessionStorage.setItem('gh_token', token);
+
+    if (statusEl) {
+      statusEl.innerHTML =
+        '<span class="status-ok">Connected as ' +
+        escHtml(user.login) +
+        '</span>';
+    }
+
+    if (btn) {
+      btn.textContent = 'Connected';
+    }
+
+    setTimeout(function() {
+      showBuildUI();
+    }, 400);
+
+    return true;
+
+  } catch (err) {
+    sessionStorage.removeItem('gh_token');
+
+    if (statusEl) {
+      statusEl.innerHTML =
+        '<span class="status-error">' +
+        escHtml(err.message) +
+        '</span>';
+    }
+
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = 'Connect GitHub';
+    }
+
+    return false;
   }
 }
+
+// =============================================================
+// Disconnect
+// =============================================================
 
 function disconnect() {
   sessionStorage.removeItem('gh_token');
@@ -140,144 +224,255 @@ function disconnect() {
   location.reload();
 }
 
-// ---- Init ----
-(function init() {
-  if (isLoggedIn()) {
+// =============================================================
+// Init
+// =============================================================
+
+(async function init() {
+
+  // -----------------------------------------------------------
+  // Check OAuth callback first
+  // -----------------------------------------------------------
+
+  const oauthHandled = await handleOAuthCallback();
+
+  // -----------------------------------------------------------
+  // Existing session
+  // -----------------------------------------------------------
+
+  if (!oauthHandled && isLoggedIn()) {
     showBuildUI();
   }
 
-  // Allow Enter key to connect if token input exists
-  var tokenInput = document.getElementById('token-input');
+  // -----------------------------------------------------------
+  // Allow Enter key to connect
+  // -----------------------------------------------------------
+
+  const tokenInput = document.getElementById('token-input');
 
   if (tokenInput) {
     tokenInput.addEventListener('keydown', function(e) {
-      if (e.key === 'Enter') connectWithToken();
+      if (e.key === 'Enter') {
+        connectWithToken();
+      }
     });
   }
 
+  // -----------------------------------------------------------
   // Drag-and-drop
+  // -----------------------------------------------------------
+
   var dz = document.getElementById('drop-zone');
 
-  dz.addEventListener('click', function() {
-    document.getElementById('file-input').click();
-  });
+  if (dz) {
 
-  dz.addEventListener('dragover', function(e) {
-    e.preventDefault();
-    dz.classList.add('dragover');
-  });
+    dz.addEventListener('click', function() {
+      document.getElementById('file-input').click();
+    });
 
-  dz.addEventListener('dragleave', function() {
-    dz.classList.remove('dragover');
-  });
+    dz.addEventListener('dragover', function(e) {
+      e.preventDefault();
+      dz.classList.add('dragover');
+    });
 
-  dz.addEventListener('drop', function(e) {
-    e.preventDefault();
-    dz.classList.remove('dragover');
+    dz.addEventListener('dragleave', function() {
+      dz.classList.remove('dragover');
+    });
 
-    if (e.dataTransfer.files.length) {
-      handleFile(e.dataTransfer.files[0]);
-    }
-  });
+    dz.addEventListener('drop', function(e) {
+      e.preventDefault();
+
+      dz.classList.remove('dragover');
+
+      if (e.dataTransfer.files.length) {
+        handleFile(e.dataTransfer.files[0]);
+      }
+    });
+  }
+
 })();
 
-// ---- Show build UI after auth ----
+// =============================================================
+// Show build UI after auth
+// =============================================================
+
 function showBuildUI() {
+
   document.getElementById('step-auth').classList.add('hidden');
-  document.getElementById('step-upload').classList.remove('hidden');
-  document.getElementById('step-signing').classList.remove('hidden');
-  document.getElementById('step-build').classList.remove('hidden');
+
+  document
+    .getElementById('step-upload')
+    .classList.remove('hidden');
+
+  document
+    .getElementById('step-signing')
+    .classList.remove('hidden');
+
+  document
+    .getElementById('step-build')
+    .classList.remove('hidden');
 }
 
-// ---- File handling ----
+// =============================================================
+// File handling
+// =============================================================
+
 function handleFileSelect(event) {
+
   if (event.target.files.length) {
     handleFile(event.target.files[0]);
   }
 }
 
 function handleFile(file) {
+
   if (!file.name.toLowerCase().endsWith('.zip')) {
     alert('Please select a .zip file.');
     return;
   }
 
-  var maxBytes = CONFIG.MAX_ZIP_MB * 1024 * 1024;
+  var maxBytes =
+    CONFIG.MAX_ZIP_MB * 1024 * 1024;
 
   if (file.size > maxBytes) {
     alert(
       'File is too large. Maximum size is ' +
-      CONFIG.MAX_ZIP_MB +
-      ' MB.'
+        CONFIG.MAX_ZIP_MB +
+        ' MB.'
     );
+
     return;
   }
 
   selectedFile = file;
 
-  document.getElementById('file-name').textContent = file.name;
-  document.getElementById('file-size').textContent = formatBytes(file.size);
-  document.getElementById('file-info').classList.remove('hidden');
-  document.getElementById('drop-zone').classList.add('hidden');
+  document.getElementById('file-name').textContent =
+    file.name;
+
+  document.getElementById('file-size').textContent =
+    formatBytes(file.size);
+
+  document
+    .getElementById('file-info')
+    .classList.remove('hidden');
+
+  document
+    .getElementById('drop-zone')
+    .classList.add('hidden');
 }
 
 function formatBytes(b) {
-  if (b < 1024) return b + ' B';
-  if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
+
+  if (b < 1024) {
+    return b + ' B';
+  }
+
+  if (b < 1048576) {
+    return (b / 1024).toFixed(1) + ' KB';
+  }
+
   return (b / 1048576).toFixed(1) + ' MB';
 }
 
-// ---- Start build ----
+// =============================================================
+// Start build
+// =============================================================
+
 async function startBuild() {
+
   if (!selectedFile) {
     alert('Please select a ZIP file first.');
     return;
   }
 
   if (!getToken()) {
-    alert('Your session expired. Please refresh the page and connect to GitHub again.');
+    alert(
+      'Your GitHub session expired. Please reconnect GitHub.'
+    );
+
     return;
   }
 
   var signingMode =
-    document.querySelector('input[name="signing"]:checked').value;
+    document.querySelector(
+      'input[name="signing"]:checked'
+    ).value;
 
-  var btnBuild = document.getElementById('btn-build');
+  var btnBuild =
+    document.getElementById('btn-build');
 
   btnBuild.disabled = true;
   btnBuild.textContent = 'Working...';
 
   // Reset progress
-  document.getElementById('progress-steps').innerHTML = '';
-  document.getElementById('progress-log').textContent = '';
+
+  document.getElementById(
+    'progress-steps'
+  ).innerHTML = '';
+
+  document.getElementById(
+    'progress-log'
+  ).textContent = '';
+
   consecutiveErrors = 0;
 
   showSection('step-progress');
 
   setProgressTitle('Starting build...');
 
-  addStep('pending', 'Uploading ZIP to GitHub...');
-  addStep('pending', 'Triggering build workflow...');
-  addStep('pending', 'Building APK...');
-  addStep('pending', 'Signing APK...');
-  addStep('pending', 'Preparing download...');
+  addStep(
+    'pending',
+    'Uploading ZIP to GitHub...'
+  );
 
-  updateStep(0, 'active', 'Uploading ZIP to GitHub...');
+  addStep(
+    'pending',
+    'Triggering build workflow...'
+  );
+
+  addStep(
+    'pending',
+    'Building APK...'
+  );
+
+  addStep(
+    'pending',
+    'Signing APK...'
+  );
+
+  addStep(
+    'pending',
+    'Preparing download...'
+  );
+
+  updateStep(
+    0,
+    'active',
+    'Uploading ZIP to GitHub...'
+  );
 
   try {
-    // Upload
-    var uploadResult =
-      await GitHubAPI.uploadZip(selectedFile);
 
-    buildReleaseId = uploadResult.releaseId;
+    // Upload
+
+    var uploadResult =
+      await GitHubAPI.uploadZip(
+        selectedFile
+      );
+
+    buildReleaseId =
+      uploadResult.releaseId;
 
     updateStep(
       0,
       'done',
-      'ZIP uploaded (' + formatBytes(selectedFile.size) + ')'
+      'ZIP uploaded (' +
+        formatBytes(selectedFile.size) +
+        ')'
     );
 
     // Trigger
+
     updateStep(
       1,
       'active',
@@ -297,6 +492,7 @@ async function startBuild() {
     );
 
     // Start polling
+
     updateStep(
       2,
       'active',
@@ -310,24 +506,40 @@ async function startBuild() {
     pollBuildStatus();
 
   } catch (err) {
-    var failedAt = -1;
-    var steps =
-      document.querySelectorAll('.progress-step');
 
-    for (var i = steps.length - 1; i >= 0; i--) {
-      if (steps[i].classList.contains('active')) {
+    var failedAt = -1;
+
+    var steps =
+      document.querySelectorAll(
+        '.progress-step'
+      );
+
+    for (
+      var i = steps.length - 1;
+      i >= 0;
+      i--
+    ) {
+
+      if (
+        steps[i].classList.contains(
+          'active'
+        )
+      ) {
+
         failedAt = i;
         break;
       }
     }
 
     if (failedAt >= 0) {
+
       updateStep(
         failedAt,
         'error',
         steps[failedAt]
           .querySelector('.step-text')
-          .textContent + ' — failed'
+          .textContent +
+          ' — failed'
       );
     }
 
@@ -339,39 +551,53 @@ async function startBuild() {
   }
 }
 
-// ---- Poll build ----
+// =============================================================
+// Poll build
+// =============================================================
+
 async function pollBuildStatus() {
+
   var elapsed =
     Date.now() - buildStartTime;
 
-  if (elapsed > CONFIG.BUILD_TIMEOUT_MS) {
+  if (
+    elapsed >
+    CONFIG.BUILD_TIMEOUT_MS
+  ) {
+
     showResult(
       'error',
       'Build timed out',
       'The build took longer than ' +
-      Math.round(CONFIG.BUILD_TIMEOUT_MS / 60000) +
-      ' minutes. Check GitHub Actions for details.'
+        Math.round(
+          CONFIG.BUILD_TIMEOUT_MS / 60000
+        ) +
+        ' minutes. Check GitHub Actions for details.'
     );
+
     return;
   }
 
   try {
+
     var run =
       await GitHubAPI.getLatestRun();
 
     consecutiveErrors = 0;
 
     if (!run) {
+
       updateStep(
         1,
         'active',
         'Waiting for build to start...'
       );
 
-      pollTimer = setTimeout(
-        pollBuildStatus,
-        CONFIG.POLL_INTERVAL_MS
-      );
+      pollTimer =
+        setTimeout(
+          pollBuildStatus,
+          CONFIG.POLL_INTERVAL_MS
+        );
 
       return;
     }
@@ -379,8 +605,10 @@ async function pollBuildStatus() {
     var status = run.status;
     var conclusion = run.conclusion;
 
-    // Update progress based on status
+    // Update progress
+
     if (status === 'queued') {
+
       setProgressTitle(
         'Queued — waiting for a runner...'
       );
@@ -391,8 +619,13 @@ async function pollBuildStatus() {
         'Waiting for GitHub Actions runner...'
       );
 
-    } else if (status === 'in_progress') {
-      setProgressTitle('Building APK...');
+    } else if (
+      status === 'in_progress'
+    ) {
+
+      setProgressTitle(
+        'Building APK...'
+      );
 
       updateStep(
         1,
@@ -414,6 +647,7 @@ async function pollBuildStatus() {
     }
 
     if (status === 'completed') {
+
       if (conclusion === 'success') {
 
         updateStep(
@@ -443,24 +677,27 @@ async function pollBuildStatus() {
         await onBuildSuccess(run);
 
       } else {
+
         await onBuildFailure(run);
       }
 
       return;
     }
 
-    pollTimer = setTimeout(
-      pollBuildStatus,
-      CONFIG.POLL_INTERVAL_MS
-    );
+    pollTimer =
+      setTimeout(
+        pollBuildStatus,
+        CONFIG.POLL_INTERVAL_MS
+      );
 
   } catch (err) {
+
     consecutiveErrors++;
 
     console.warn(
       'Poll error (' +
-      consecutiveErrors +
-      '):',
+        consecutiveErrors +
+        '):',
       err.message
     );
 
@@ -468,22 +705,23 @@ async function pollBuildStatus() {
       consecutiveErrors >=
       MAX_CONSECUTIVE_ERRORS
     ) {
+
       showResult(
         'error',
         'Lost connection to GitHub',
         'Failed to check build status ' +
-        MAX_CONSECUTIVE_ERRORS +
-        ' times in a row. ' +
-        'Check your internet connection, then refresh the page. ' +
-        'Your build may still be running on GitHub.'
+          MAX_CONSECUTIVE_ERRORS +
+          ' times in a row. ' +
+          'Check your internet connection, then refresh the page. Your build may still be running on GitHub.'
       );
 
       return;
     }
 
-    // Show a subtle warning but keep polling
     var logEl =
-      document.getElementById('progress-log');
+      document.getElementById(
+        'progress-log'
+      );
 
     logEl.textContent +=
       '[Retry ' +
@@ -495,19 +733,28 @@ async function pollBuildStatus() {
       '\n';
 
     document
-      .getElementById('progress-details')
+      .getElementById(
+        'progress-details'
+      )
       .classList.remove('hidden');
 
-    pollTimer = setTimeout(
-      pollBuildStatus,
-      CONFIG.POLL_INTERVAL_MS
-    );
+    pollTimer =
+      setTimeout(
+        pollBuildStatus,
+        CONFIG.POLL_INTERVAL_MS
+      );
   }
 }
 
-// ---- Build success ----
+// =============================================================
+// Build success
+// =============================================================
+
 async function onBuildSuccess(run) {
-  setProgressTitle('APK Ready!');
+
+  setProgressTitle(
+    'APK Ready!'
+  );
 
   updateStep(
     4,
@@ -516,6 +763,7 @@ async function onBuildSuccess(run) {
   );
 
   try {
+
     var assets =
       await GitHubAPI.getReleaseAssets(
         buildReleaseId
@@ -525,21 +773,33 @@ async function onBuildSuccess(run) {
     var keystore = null;
     var properties = null;
 
-    for (var i = 0; i < assets.length; i++) {
-      var name = assets[i].name;
+    for (
+      var i = 0;
+      i < assets.length;
+      i++
+    ) {
 
-      if (name.endsWith('.apk')) {
+      var name =
+        assets[i].name;
+
+      if (
+        name.endsWith('.apk')
+      ) {
+
         apk = assets[i];
 
       } else if (
         name.endsWith('.jks') ||
         name.endsWith('.keystore')
       ) {
+
         keystore = assets[i];
 
       } else if (
-        name === 'keystore-properties.txt'
+        name ===
+        'keystore-properties.txt'
       ) {
+
         properties = assets[i];
       }
     }
@@ -554,9 +814,12 @@ async function onBuildSuccess(run) {
       '<p>Build completed successfully.</p>';
 
     if (apk) {
+
       html +=
         '<a class="download-btn" href="' +
-        escAttr(apk.browser_download_url) +
+        escAttr(
+          apk.browser_download_url
+        ) +
         '" download>Download ' +
         escHtml(apk.name) +
         ' (' +
@@ -564,10 +827,10 @@ async function onBuildSuccess(run) {
         ')</a>';
 
     } else {
+
       html +=
         '<p class="status-error">' +
-        'APK file not found in release assets. ' +
-        'Check the release on GitHub.' +
+        'APK file not found in release assets. Check the release on GitHub.' +
         '</p>';
     }
 
@@ -582,23 +845,34 @@ async function onBuildSuccess(run) {
     ) {
 
       if (keystore || properties) {
+
         html +=
-          '<div class="warning-box">' +
-          'Save your signing key! You need the same key for future app updates.' +
+          '<div class="warning-box">';
+
+        html +=
+          'Save your signing key! You need the same key for future app updates.';
+
+        html +=
           '</div>';
       }
 
       if (keystore) {
+
         html +=
           '<a class="download-btn download-btn-secondary" href="' +
-          escAttr(keystore.browser_download_url) +
+          escAttr(
+            keystore.browser_download_url
+          ) +
           '" download>Download Keystore</a>';
       }
 
       if (properties) {
+
         html +=
           '<a class="download-btn download-btn-secondary" href="' +
-          escAttr(properties.browser_download_url) +
+          escAttr(
+            properties.browser_download_url
+          ) +
           '" download>Download Key Properties</a>';
       }
     }
@@ -606,11 +880,10 @@ async function onBuildSuccess(run) {
     html +=
       '<a class="link-btn" href="' +
       escAttr(run.html_url) +
-      '" target="_blank" rel="noopener">' +
-      'View Build Details on GitHub' +
-      '</a>';
+      '" target="_blank" rel="noopener">View Build Details on GitHub</a>';
 
-    html += '</div>';
+    html +=
+      '</div>';
 
     showResultHTML(html);
 
@@ -628,25 +901,30 @@ async function onBuildSuccess(run) {
     html2 +=
       '<a class="link-btn" href="' +
       escAttr(run.html_url) +
-      '" target="_blank" rel="noopener">' +
-      'View Release on GitHub to download' +
-      '</a>';
+      '" target="_blank" rel="noopener">View Release on GitHub to download</a>';
 
-    html2 += '</div>';
+    html2 +=
+      '</div>';
 
     showResultHTML(html2);
   }
 }
 
-// ---- Build failure ----
+// =============================================================
+// Build failure
+// =============================================================
+
 async function onBuildFailure(run) {
+
   updateStep(
     1,
     'error',
     'Build failed'
   );
 
-  setProgressTitle('Build Failed');
+  setProgressTitle(
+    'Build Failed'
+  );
 
   var html =
     '<div class="result-error">';
@@ -673,23 +951,30 @@ async function onBuildFailure(run) {
   html +=
     '<a class="link-btn" href="' +
     escAttr(run.html_url) +
-    '" target="_blank" rel="noopener">' +
-    'View Build Logs on GitHub' +
-    '</a>';
+    '" target="_blank" rel="noopener">View Build Logs on GitHub</a>';
 
-  html += '</div>';
+  html +=
+    '</div>';
 
   showResultHTML(html);
 }
 
-// ---- UI helpers ----
+// =============================================================
+// UI helpers
+// =============================================================
+
 function showSection(id) {
+
   document
-    .getElementById('step-progress')
+    .getElementById(
+      'step-progress'
+    )
     .classList.add('hidden');
 
   document
-    .getElementById('step-result')
+    .getElementById(
+      'step-result'
+    )
     .classList.add('hidden');
 
   document
@@ -698,12 +983,16 @@ function showSection(id) {
 }
 
 function setProgressTitle(t) {
+
   document
-    .getElementById('progress-title')
+    .getElementById(
+      'progress-title'
+    )
     .textContent = t;
 }
 
 function addStep(cls, text) {
+
   var div =
     document.createElement('div');
 
@@ -718,20 +1007,30 @@ function addStep(cls, text) {
     '</span>';
 
   document
-    .getElementById('progress-steps')
+    .getElementById(
+      'progress-steps'
+    )
     .appendChild(div);
 }
 
-function updateStep(index, cls, text) {
+function updateStep(
+  index,
+  cls,
+  text
+) {
+
   var steps =
     document.querySelectorAll(
       '.progress-step'
     );
 
-  if (!steps[index]) return;
+  if (!steps[index]) {
+    return;
+  }
 
   steps[index].className =
-    'progress-step ' + cls;
+    'progress-step ' +
+    cls;
 
   var textEl =
     steps[index].querySelector(
@@ -748,6 +1047,7 @@ function showResult(
   title,
   message
 ) {
+
   var cls =
     type === 'error'
       ? 'result-error'
@@ -755,26 +1055,33 @@ function showResult(
 
   showResultHTML(
     '<div class="' +
-    cls +
-    '">' +
-    '<h2>' +
-    escHtml(title) +
-    '</h2>' +
-    '<p>' +
-    escHtml(message) +
-    '</p>' +
-    '</div>'
+      cls +
+      '">' +
+      '<h2>' +
+      escHtml(title) +
+      '</h2>' +
+      '<p>' +
+      escHtml(message) +
+      '</p>' +
+      '</div>'
   );
 }
 
 function showResultHTML(html) {
+
   if (pollTimer) {
-    clearTimeout(pollTimer);
+
+    clearTimeout(
+      pollTimer
+    );
+
     pollTimer = null;
   }
 
   document
-    .getElementById('step-progress')
+    .getElementById(
+      'step-progress'
+    )
     .classList.add('hidden');
 
   var rc =
@@ -785,34 +1092,50 @@ function showResultHTML(html) {
   rc.innerHTML = html;
 
   document
-    .getElementById('step-result')
+    .getElementById(
+      'step-result'
+    )
     .classList.remove('hidden');
 
   // Reset build button
+
   var btn =
     document.getElementById(
       'btn-build'
     );
 
   btn.disabled = false;
-  btn.textContent = 'BUILD APK';
+
+  btn.textContent =
+    'BUILD APK';
 
   selectedFile = null;
 
   document
-    .getElementById('drop-zone')
+    .getElementById(
+      'drop-zone'
+    )
     .classList.remove('hidden');
 
   document
-    .getElementById('file-info')
+    .getElementById(
+      'file-info'
+    )
     .classList.add('hidden');
 
   document
-    .getElementById('file-input')
+    .getElementById(
+      'file-input'
+    )
     .value = '';
 }
 
+// =============================================================
+// Utilities
+// =============================================================
+
 function sleep(ms) {
+
   return new Promise(
     function(r) {
       setTimeout(r, ms);
@@ -821,6 +1144,7 @@ function sleep(ms) {
 }
 
 function escHtml(s) {
+
   var d =
     document.createElement('div');
 
@@ -830,10 +1154,26 @@ function escHtml(s) {
 }
 
 function escAttr(s) {
+
   return s
-    .replace(/&/g, '&amp;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+    .replace(
+      /&/g,
+      '&amp;'
+    )
+    .replace(
+      /"/g,
+      '&quot;'
+    )
+    .replace(
+      /'/g,
+      '&#39;'
+    )
+    .replace(
+      /</g,
+      '&lt;'
+    )
+    .replace(
+      />/g,
+      '&gt;'
+    );
 }
