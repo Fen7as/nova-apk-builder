@@ -3,7 +3,7 @@
 // =============================================================
 
 const CONFIG = {
-  GITHUB_OWNER: 'Professional-X',
+  GITHUB_OWNER: 'Fen7as',
   GITHUB_REPO:  'nova-apk-builder',
   API_BASE: 'https://api.github.com',
   MAX_ZIP_MB: 50,
